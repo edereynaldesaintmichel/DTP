@@ -1,0 +1,4 @@
+torch>=2.7
+transformers>=5.0,<6
+datasets>=3.0
+pytest
