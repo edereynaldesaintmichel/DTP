@@ -85,7 +85,7 @@ class MockedDTP(DTPQwen3):
         return o
 
 
-@pytest.mark.parametrize("delta", [0, 1, 3, 4])
+@pytest.mark.parametrize("delta", [0, 0.5, 1, 1.5, 2.5, 3, 3.75, 4])
 def test_orchestrator_matches_blog_equations(delta):
     hf = tiny_model()
     L = 4
@@ -97,26 +97,48 @@ def test_orchestrator_matches_blog_equations(delta):
     n_modules = dtp.n_modules
     assert len(outs) == n_modules
 
-    # Literal per-device reference of the three-stage equations.
+    # Literal per-device reference of the three-stage equations, sender-side:
+    # the broadcast of module m lands (1 - frac) at m + d and frac at m + d + 1.
+    d_int, frac = int(delta), delta - int(delta)
     emb = hf.model.embed_tokens(x_ids)
     streams = []
     for l in range(L):
         X = emb.clone()
         for n in range(n_modules):
             X = X + dtp._own_scale(n) * outs[n][l]
-            m = n - delta
-            if m >= 0:  # broadcasts from module m land now
-                for j in range(L):
-                    if j != l:
-                        X = X + outs[m][j]
+            for m in range(n_modules):
+                for arrive, w in ((m + d_int, 1.0 - frac), (m + d_int + 1, frac)):
+                    if arrive == n and w > 0:
+                        for j in range(L):
+                            if j != l:
+                                X = X + w * outs[m][j]
         streams.append(hf.model.norm(X))
     ref = hf.lm_head(torch.stack(streams).mean(0))
     assert torch.allclose(ref, got, atol=1e-4), (ref - got).abs().max()
 
 
-def test_kv_cache_matches_full_forward():
+def test_fractional_delta_is_continuous():
     hf = tiny_model()
-    dtp = DTPQwen3(hf, n_devices=2, delta=2)  # hq=4, kvp=2 -> exercises GQA expand
+    x = ids()
+    dtp = DTPQwen3(hf, n_devices=4, delta=0)
+
+    def logits(dv):
+        dtp.delta = dv
+        with torch.no_grad():
+            return dtp(x).logits
+
+    big = (logits(0.0) - logits(4.0)).abs().max().item()
+    assert big > 1e-3  # delta genuinely changes the function on this model
+    eps = 1e-3
+    for base in (0.0, 0.999, 1.0, 2.5, 3.999):  # crosses integer boundaries
+        step = (logits(base) - logits(base + eps)).abs().max().item()
+        assert step < 0.02 * big + 1e-5, (base, step, big)
+
+
+@pytest.mark.parametrize("delta", [2, 1.5])
+def test_kv_cache_matches_full_forward(delta):
+    hf = tiny_model()
+    dtp = DTPQwen3(hf, n_devices=2, delta=delta)  # hq=4, kvp=2 -> exercises GQA expand
     x = ids(1, 12)
     full = dtp(x).logits
 
@@ -151,7 +173,37 @@ def test_delta_bounds():
     hf = tiny_model()
     with pytest.raises(AssertionError):
         DTPQwen3(hf, n_devices=2, delta=5)  # > n_modules // 2 = 4
+    with pytest.raises(AssertionError):
+        DTPQwen3(hf, n_devices=2, delta=4.5)
     DTPQwen3(hf, n_devices=2, delta=4)
+
+
+def test_delta_scheduler():
+    from scripts.finetune import DeltaScheduler
+
+    s = DeltaScheduler(slope=0.005, ramp=100, cap=28, gate_ppl=20.0)
+    for _ in range(50):
+        v = s.step()
+    assert v == pytest.approx(0.000025 * 50**2)  # quadratic ramp
+    for _ in range(50):
+        v = s.step()
+    assert v == pytest.approx(0.25)  # C1 joint: 0.005*100 - 0.25
+    for _ in range(750):
+        v = s.step()
+    assert v == pytest.approx(4.0)  # crosses delta=4 at s=850
+    s.gate(25.0)  # ppl above the gate: clock freezes
+    for _ in range(100):
+        v = s.step()
+    assert v == pytest.approx(4.0)
+    s.gate(15.0)  # back under: resumes where it left off
+    for _ in range(1150):
+        v = s.step()
+    assert v == pytest.approx(9.75)  # nominal end-of-run value at s=2000
+
+    s2 = DeltaScheduler(slope=0.005, ramp=100, cap=1.0, gate_ppl=20.0)
+    for _ in range(2000):
+        v2 = s2.step()
+    assert v2 == 1.0
 
 
 def test_generate_runs():

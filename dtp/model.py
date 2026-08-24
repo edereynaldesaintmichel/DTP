@@ -16,6 +16,14 @@ At the end, the final RMSNorm is applied per device and the L outputs are
 averaged (the blog's final all-reduce; averaging after the linear LM head is
 identical to averaging before it, so the head runs once).
 
+delta may be fractional: with delta = d + a (0 < a < 1), the broadcast of
+module m lands with weight (1 - a) at module m + d and weight a at module
+m + d + 1, and the stage-1/3 sqrt(L) own-scales are interpolated the same way
+— at each step the update is the convex combination of the delta = d and
+delta = d + 1 dynamics, so the forward is continuous in delta. `delta` is a
+plain attribute and may be changed between forwards (e.g. annealed during
+training).
+
 Qwen3 is a standard pre-norm architecture: each module's output is added to the
 residual raw, with no norm inside the branch. The per-device partial outputs
 therefore sum exactly to the vanilla module output and the blog's equations
@@ -84,7 +92,7 @@ class DTPQwen3(nn.Module):
         self,
         hf_model,
         n_devices: int = 4,
-        delta: int = 4,
+        delta: float = 4,
         stage3_own_scale: str = "sqrt_l",  # "sqrt_l" | "one"
         gradient_checkpointing: bool = False,
     ):
@@ -184,14 +192,21 @@ class DTPQwen3(nn.Module):
 
     # ----------------------------------------------------------------- forward
 
-    def _own_scale(self, n):
-        if self.delta == 0:
+    def _own_scale_at(self, n, delta):
+        if delta == 0:
             return 1.0
-        if n < self.delta:
+        if n < delta:
             return math.sqrt(self.L)
-        if n >= self.n_modules - self.delta and self.stage3_own_scale == "sqrt_l":
+        if n >= self.n_modules - delta and self.stage3_own_scale == "sqrt_l":
             return math.sqrt(self.L)
         return 1.0
+
+    def _own_scale(self, n):
+        d = int(self.delta)
+        a = self.delta - d
+        if a == 0:
+            return self._own_scale_at(n, d)
+        return (1 - a) * self._own_scale_at(n, d) + a * self._own_scale_at(n, d + 1)
 
     @staticmethod
     def _build_mask(S, past, device):
@@ -218,7 +233,9 @@ class DTPQwen3(nn.Module):
         mask, is_causal = self._build_mask(S, past, device)
 
         x = h.unsqueeze(0).expand(self.L, B, S, h.shape[-1])
-        queue = []
+        d = int(self.delta)
+        a = self.delta - d
+        queue = []  # in-flight (module_idx, partial_output) pairs
         n = 0
         for layer in model.layers:
             for kind in ("attn", "mlp"):
@@ -232,14 +249,18 @@ class DTPQwen3(nn.Module):
                 else:
                     o = self._module_out(layer, kind, x, **kw)
                 x = x + self._own_scale(n) * o
-                queue.append(o)
-                if n >= self.delta:
-                    o_past = queue.pop(0)
-                    if self.L > 1:
-                        x = x + (o_past.sum(dim=0, keepdim=True) - o_past)
+                queue.append((n, o))
+                if self.L > 1:
+                    # broadcasts from module m land (1 - a) at m + d, a at m + d + 1
+                    for m, w in ((n - d, 1.0 - a), (n - d - 1, a)):
+                        if w > 0.0 and m >= 0:
+                            o_past = queue[m - queue[0][0]][1]
+                            x = x + w * (o_past.sum(dim=0, keepdim=True) - o_past)
+                while queue and queue[0][0] <= n - d - 1:
+                    queue.pop(0)
                 n += 1
-        # entries still in `queue` are the last `delta` modules' outputs: their
-        # cross-device broadcasts never land (stage 3).
+        # entries still in `queue` are the trailing modules whose cross-device
+        # broadcasts never (fully) land before the end of the network (stage 3).
 
         x = model.norm(x)  # per-device final norm
         x = x.mean(dim=0)  # final all-reduce average; LM head is linear so

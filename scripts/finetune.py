@@ -5,6 +5,11 @@ Typical runs:
   # recover DTP by distilling from the frozen original model (recommended)
   python scripts/finetune.py --devices 4 --delta 4 --distill --freeze-embed \
       --micro-batch 4 --grad-accum 16 --steps 2000 --out runs/dtp_l4_d4_kd
+  # annealed continuous delta: ramps 0 -> ~10 nominal over 2000 steps
+  # (quadratic for 100 steps, then 0.005/step; crosses 4 around step 850),
+  # pausing whenever eval ppl exceeds --gate-ppl so training catches up
+  python scripts/finetune.py --devices 4 --distill --freeze-embed --delta-schedule \
+      --micro-batch 4 --grad-accum 16 --steps 2000 --out runs/dtp_l4_anneal_kd
   # one-hot CE variants (need the --vanilla drift baseline for a fair comparison)
   python scripts/finetune.py --devices 4 --delta 4 --steps 2000 --out runs/dtp_l4_d4
   python scripts/finetune.py --vanilla --steps 2000 --out runs/vanilla_baseline
@@ -48,6 +53,34 @@ def kd_loss(student_logits, teacher_logits, labels, ce_weight, chunk=256):
     return total / labels.numel()
 
 
+class DeltaScheduler:
+    """Continuous-delta ramp: quadratic for the first `ramp` scheduler steps
+    (y = slope/(2*ramp) * s^2), then linear (y = slope * (s - ramp/2)) — C1 at
+    the joint — capped at `cap`. The clock `s` advances only while the last
+    gate check passed (eval ppl <= gate_ppl), so the ramp pauses until training
+    catches up and resumes where it left off."""
+
+    def __init__(self, slope, ramp, cap, gate_ppl):
+        self.slope, self.ramp, self.cap, self.gate_ppl = slope, ramp, cap, gate_ppl
+        self.s = 0
+        self.open = True
+
+    def gate(self, ppl):
+        self.open = ppl <= self.gate_ppl
+        return self.open
+
+    @property
+    def value(self):
+        s = self.s
+        y = self.slope * s * s / (2 * self.ramp) if s <= self.ramp else self.slope * (s - self.ramp / 2)
+        return min(y, self.cap)
+
+    def step(self):
+        if self.open:
+            self.s += 1
+        return self.value
+
+
 def lr_at(step, base, warmup, total, min_ratio):
     if step < warmup:
         return base * (step + 1) / warmup
@@ -59,7 +92,21 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model-id", default="Qwen/Qwen3-0.6B-Base")
     p.add_argument("--devices", type=int, default=4)
-    p.add_argument("--delta", type=int, default=4)
+    p.add_argument("--delta", type=float, default=4)
+    p.add_argument("--delta-schedule", action="store_true",
+                   help="anneal delta from 0 (quadratic ramp then linear), gated on eval ppl")
+    p.add_argument("--delta-slope", type=float, default=0.005,
+                   help="delta growth per ungated step in the linear regime")
+    p.add_argument("--delta-ramp", type=int, default=100,
+                   help="length of the initial quadratic ramp, in scheduler steps")
+    p.add_argument("--delta-max", type=float, default=None,
+                   help="cap for the annealed delta (default: the model limit, n_layers)")
+    p.add_argument("--gate-ppl", type=float, default=20.0,
+                   help="pause the delta ramp while quick eval ppl exceeds this")
+    p.add_argument("--gate-every", type=int, default=25,
+                   help="steps between quick gate-ppl checks")
+    p.add_argument("--gate-blocks", type=int, default=8,
+                   help="eval blocks used for the quick gate-ppl check")
     p.add_argument("--stage3-scale", default="sqrt_l", choices=["sqrt_l", "one"])
     p.add_argument("--vanilla", action="store_true", help="fine-tune the stock model instead (baseline)")
     p.add_argument("--distill", action="store_true",
@@ -138,6 +185,14 @@ def main():
                 t_logits = teacher(inp).logits
             return kd_loss(model(inp).logits, t_logits, lab, args.ce_weight, args.kd_chunk)
 
+    sched = None
+    if args.delta_schedule:
+        assert not args.vanilla, "--delta-schedule requires the DTP model"
+        assert not args.compile, "--delta-schedule changes delta every step, which would retrigger torch.compile"
+        cap = args.delta_max if args.delta_max is not None else model.n_modules // 2
+        sched = DeltaScheduler(args.delta_slope, args.delta_ramp, cap, args.gate_ppl)
+        model.delta = sched.value  # start at 0: exactly the vanilla model
+
     if args.freeze_embed:
         hf.model.embed_tokens.weight.requires_grad_(False)
 
@@ -158,7 +213,7 @@ def main():
         args.micro_batch,
     )
     log = open(out / "log.csv", "w")
-    log.write("step,loss,lr,tok_per_s,eval_ppl,eval_kl\n")
+    log.write("step,loss,lr,tok_per_s,eval_ppl,eval_kl,delta,gate_ppl\n")
 
     @torch.no_grad()
     def eval_kl():
@@ -179,6 +234,14 @@ def main():
         model.train()
         return ppl, kl
 
+    @torch.no_grad()
+    def quick_gate_ppl():
+        model.eval()
+        with torch.autocast("cuda", torch.bfloat16):
+            ppl, _ = perplexity(eval_logits, eval_blk[: args.gate_blocks], device, micro_batch=4)
+        model.train()
+        return ppl
+
     def fmt(ppl, kl):
         return f"eval ppl {ppl:.3f}" + (f"  KL {kl:.4f}" if kl is not None else "")
 
@@ -187,6 +250,12 @@ def main():
     tokens_per_step = args.micro_batch * args.grad_accum * args.seq_len
     t0 = time.time()
     for step in range(args.steps):
+        gate_p = None
+        if sched is not None:
+            if step and step % args.gate_every == 0:
+                gate_p = quick_gate_ppl()
+                sched.gate(gate_p)
+            model.delta = sched.step()
         lr = lr_at(step, args.lr, args.warmup, args.steps, args.min_lr_ratio)
         for g in opt.param_groups:
             g["lr"] = lr
@@ -202,16 +271,19 @@ def main():
         opt.zero_grad(set_to_none=True)
 
         tps = tokens_per_step * (step + 1) / (time.time() - t0)
+        dmsg = "" if sched is None else f"  d {model.delta:.3f}" + ("" if sched.open else " [gated]")
         ppl_s, kl_s = "", ""
         if args.eval_every and (step + 1) % args.eval_every == 0:
             ppl, kl = run_eval()
             ppl_s, kl_s = f"{ppl:.3f}", "" if kl is None else f"{kl:.4f}"
-            print(f"step {step + 1}: loss {loss_acc:.4f}  lr {lr:.2e}  {tps:,.0f} tok/s  {fmt(ppl, kl)}")
+            print(f"step {step + 1}: loss {loss_acc:.4f}  lr {lr:.2e}{dmsg}  {tps:,.0f} tok/s  {fmt(ppl, kl)}")
         elif (step + 1) % 10 == 0:
-            print(f"step {step + 1}: loss {loss_acc:.4f}  lr {lr:.2e}  {tps:,.0f} tok/s")
+            print(f"step {step + 1}: loss {loss_acc:.4f}  lr {lr:.2e}{dmsg}  {tps:,.0f} tok/s")
         if step == 0:
             print(f"peak CUDA memory after step 1: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
-        log.write(f"{step + 1},{loss_acc:.6f},{lr:.6e},{tps:.1f},{ppl_s},{kl_s}\n")
+        delta_s = "" if args.vanilla else f"{float(model.delta):.4f}"
+        gate_s = "" if gate_p is None else f"{gate_p:.3f}"
+        log.write(f"{step + 1},{loss_acc:.6f},{lr:.6e},{tps:.1f},{ppl_s},{kl_s},{delta_s},{gate_s}\n")
         log.flush()
 
         if args.save_every and (step + 1) % args.save_every == 0:
