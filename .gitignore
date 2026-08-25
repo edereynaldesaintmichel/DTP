@@ -1,4 +1,4 @@
 .venv
 .pytest_cache
 */__pycache__
-runs/dtp_l4_d4_kd/model_state.pt
+runs
