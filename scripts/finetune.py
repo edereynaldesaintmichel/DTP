@@ -133,6 +133,15 @@ def main():
     p.add_argument("--save-every", type=int, default=500)
     p.add_argument("--out", default="runs/dtp")
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--init-state", default=None,
+                   help="state dict to load into the student before training (e.g. a permuted model)")
+    p.add_argument("--init-perm", default=None,
+                   help="head/neuron device assignment (from expertise.py --save-dir, *.perm.pt) applied "
+                        "to the student as a pure permutation before training")
+    p.add_argument("--no-save", action="store_true", help="do not write model_state.pt")
+    p.add_argument("--shared", type=int, default=0,
+                   help="shared-expert size: FFN neurons per layer replicated on every device (dtp/shared_model.py); "
+                        "the layout from --init-perm must mark them with device id = --devices")
     args = p.parse_args()
 
     assert torch.cuda.is_available(), "finetune.py expects a CUDA GPU"
@@ -146,7 +155,15 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(args.model_id)
     # fp32 master weights + bf16 autocast
-    hf = Qwen3ForCausalLM.from_pretrained(args.model_id, dtype=torch.float32).to(device)
+    hf = Qwen3ForCausalLM.from_pretrained(args.model_id, dtype=torch.float32)
+    if args.init_state:
+        hf.load_state_dict(torch.load(args.init_state, map_location="cpu", weights_only=True))
+    if args.init_perm:
+        from scripts.expertise import apply_permutation
+
+        perm = torch.load(args.init_perm, weights_only=True)
+        apply_permutation(hf, perm["head_dev"], perm["neur_dev"], args.devices)
+    hf = hf.to(device)
 
     if args.vanilla:
         assert not args.distill, "--distill is for repairing the DTP model"
@@ -160,10 +177,18 @@ def main():
         def eval_logits(x):
             return hf(x).logits
     else:
-        model = DTPQwen3(
-            hf, n_devices=args.devices, delta=args.delta,
-            stage3_own_scale=args.stage3_scale, gradient_checkpointing=True,
-        )
+        if args.shared:
+            from dtp.shared_model import SharedDTPQwen3
+
+            model = SharedDTPQwen3(
+                hf, n_devices=args.devices, delta=args.delta, n_shared=args.shared,
+                stage3_own_scale=args.stage3_scale, gradient_checkpointing=True,
+            )
+        else:
+            model = DTPQwen3(
+                hf, n_devices=args.devices, delta=args.delta,
+                stage3_own_scale=args.stage3_scale, gradient_checkpointing=True,
+            )
         model.train()
 
         def loss_fn(x):
@@ -271,27 +296,25 @@ def main():
         opt.zero_grad(set_to_none=True)
 
         tps = tokens_per_step * (step + 1) / (time.time() - t0)
-        dmsg = "" if sched is None else f"  d {model.delta:.3f}" + ("" if sched.open else " [gated]")
         ppl_s, kl_s = "", ""
         if args.eval_every and (step + 1) % args.eval_every == 0:
             ppl, kl = run_eval()
             ppl_s, kl_s = f"{ppl:.3f}", "" if kl is None else f"{kl:.4f}"
-            print(f"step {step + 1}: loss {loss_acc:.4f}  lr {lr:.2e}{dmsg}  {tps:,.0f} tok/s  {fmt(ppl, kl)}")
+            print(f"step {step + 1}: loss {loss_acc:.4f}  lr {lr:.2e}  {tps:,.0f} tok/s  {fmt(ppl, kl)}")
         elif (step + 1) % 10 == 0:
-            print(f"step {step + 1}: loss {loss_acc:.4f}  lr {lr:.2e}{dmsg}  {tps:,.0f} tok/s")
+            print(f"step {step + 1}: loss {loss_acc:.4f}  lr {lr:.2e}  {tps:,.0f} tok/s")
         if step == 0:
             print(f"peak CUDA memory after step 1: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
-        delta_s = "" if args.vanilla else f"{float(model.delta):.4f}"
-        gate_s = "" if gate_p is None else f"{gate_p:.3f}"
-        log.write(f"{step + 1},{loss_acc:.6f},{lr:.6e},{tps:.1f},{ppl_s},{kl_s},{delta_s},{gate_s}\n")
+        log.write(f"{step + 1},{loss_acc:.6f},{lr:.6e},{tps:.1f},{ppl_s},{kl_s}\n")
         log.flush()
 
-        if args.save_every and (step + 1) % args.save_every == 0:
+        if args.save_every and (step + 1) % args.save_every == 0 and not args.no_save:
             torch.save(hf.state_dict(), out / "model_state.pt")
 
-    torch.save(hf.state_dict(), out / "model_state.pt")
     print(f"final: {fmt(*run_eval())}")
-    print(f"saved to {out / 'model_state.pt'}")
+    if not args.no_save:
+        torch.save(hf.state_dict(), out / "model_state.pt")
+        print(f"saved to {out / 'model_state.pt'}")
 
 
 if __name__ == "__main__":

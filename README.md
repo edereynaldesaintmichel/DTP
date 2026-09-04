@@ -114,6 +114,67 @@ Interesting sweeps: `--delta {1,2,4,8}` × `--devices {2,4,8}` (fine-tune each),
 and `--stage3-scale one` — mirroring the blog's exposed-wait-time-vs-loss
 trade-off, with δ as the knob.
 
+## Expertised sharding (delta = 1)
+
+The DTP layout is a free choice: which KV heads and which FFN neurons go to
+which device. At delta = 1 a module only misses the *other* devices' output of
+the immediately preceding module, so the damage is smallest when each device's
+FFN shard is the part of the FFN that reads most from that device's own heads,
+and each device's next-layer heads read most from its own FFN shard. This is a
+pure permutation of the HF weights (rows of q/k/v, gate, up; columns of o_proj
+and down), so the dense model is unchanged. It is an initialisation only.
+
+Pipeline, in order (all on one 5090, a few minutes end to end):
+
+```bash
+# 1. affinity scores: how much each FFN neuron's output (through the down
+#    projection) depends on each KV group, and how much the next layer's
+#    q/k/v read from each neuron. One forward pass, 64k tokens, no gradient.
+python scripts/affinity_stats.py --out runs/affinity_stats.pt
+
+# 2. layout: alternate exact assignment of neurons (balanced linear assignment)
+#    and heads (exhaustive over the 2520 splits of 8 KV groups into 4 pairs),
+#    apply the permutation, and report untrained DTP ppl vs random layouts.
+python scripts/expertise.py --score fo --save-dir runs/perms
+
+# 3. distil the DTP model from the dense one, starting from that layout
+python scripts/finetune.py --devices 4 --delta 1 --distill --freeze-embed \
+    --micro-batch 4 --grad-accum 4 --steps 2000 --warmup 100 --eval-every 100 \
+    --eval-blocks 16 --no-save --init-perm runs/perms/optimised.perm.pt --out runs/train_fo
+# same command with --init-perm runs/perms/random1.perm.pt for the baseline
+```
+
+Results (Qwen3-0.6B-Base, L = 4, delta = 1, same recipe for every layout;
+logs and the figure are in `runs/expertise_logs/`):
+
+| step | expertised init: ppl / KL | random sharding: ppl / KL |
+|---|---|---|
+| 0 (no training) | 608 / 3.85 | 3088 / 5.51 |
+| 500 | 18.87 / 0.398 | 20.95 / 0.501 |
+| 1000 | 17.37 / 0.322 | 18.82 / 0.404 |
+| 2000 | 16.42 / 0.265 | 17.82 / 0.346 |
+
+The expertised init reaches the random layout's final perplexity at step 814,
+i.e. 2.5x fewer steps. At 500 steps the dot-product score (`--score add`)
+gives 19.31 and the first-order score (`--score fo`) 18.33, vs 20.8 and 21.6
+for two random seeds.
+
+Code, in reading order:
+
+- `scripts/affinity_stats.py` — the three affinity scores (`add`, `abl`, `fo`)
+  for the two edges per layer (heads -> same-layer neurons, neurons -> next-layer heads)
+- `scripts/expertise.py` — `Chain` (the alternating optimiser), `apply_permutation`,
+  random baselines, untrained evaluation
+- `scripts/finetune.py` — `--init-perm` applies a saved layout before training
+- `dtp/shared_model.py`, `scripts/expertise_shared.py` — variant with a "shared
+  expert": 10% of each layer's neurons replicated on every device, added locally
+  and never broadcast (`--shared 308` in finetune.py). 16.26 / 0.260 at 2000
+  steps, i.e. within noise of the plain expertised init.
+- diagnostics behind the "where the gain comes from" story: `scripts/massive_probe.py`
+  (the layer-2 massive-activation neurons and the heads that drive them),
+  `scripts/colocate_test.py` (co-locating them with their KV group, everything
+  else fixed), `scripts/random_diag.py` (why random layouts differ so much untrained)
+
 ## Tests
 
 ```bash
@@ -132,4 +193,6 @@ gradient-checkpointed loss/grads matching the plain path.
 - `dtp/model.py` — `DTPQwen3` wrapper: sharding, delay queue, cache, generate
 - `dtp/data.py` — streamed packed fine-tuning data, wikitext-2 perplexity
 - `scripts/eval_ppl.py`, `scripts/finetune.py`, `scripts/generate.py`
+- `scripts/affinity_stats.py`, `scripts/expertise.py`, `scripts/expertise_shared.py`,
+  `dtp/shared_model.py` — expertised sharding, see the section above
 - `tests/test_dtp.py`
