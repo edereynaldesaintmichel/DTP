@@ -1,7 +1,7 @@
 .venv
 .pytest_cache
 */__pycache__
-runs
+runs/*
 !runs/expertise_logs
 !runs/expertise_logs/*
 .vscode

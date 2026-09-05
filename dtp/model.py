@@ -32,8 +32,11 @@ Gemma 3, whose sandwich post-norms act on the full module output that no device
 holds under DTP.)
 
 All shard weights are views into the wrapped HF model's parameters: training the
-DTP wrapper updates the HF model in place, and checkpoints remain valid
-Qwen3ForCausalLM state dicts.
+DTP wrapper updates the HF model in place, and checkpoints remain valid HF
+state dicts.
+
+Any pre-norm GQA/SwiGLU model with the HF Llama module layout works (Qwen3,
+Llama, h2o-danube3, ...): the q/k head norms are applied only if present.
 """
 
 import math
@@ -104,7 +107,7 @@ class DTPQwen3(nn.Module):
         assert cfg.num_key_value_heads % L == 0, "n_devices must divide num_key_value_heads"
         assert cfg.intermediate_size % L == 0, "n_devices must divide intermediate_size"
         assert not cfg.attention_bias, "biased attention projections not supported"
-        assert not cfg.use_sliding_window and cfg.sliding_window is None
+        assert not getattr(cfg, "use_sliding_window", False) and getattr(cfg, "sliding_window", None) is None
         assert 0 <= delta <= self.n_modules // 2, (
             f"delta must be in [0, {self.n_modules // 2}] (it is counted in modules, 2 per layer)"
         )
@@ -129,7 +132,7 @@ class DTPQwen3(nn.Module):
         attn = layer.self_attn
         cfg = self.config
         Lc, B, S, D = x.shape
-        hd = attn.head_dim  # Qwen3: explicit head_dim, num_heads * head_dim != hidden_size
+        hd = attn.head_dim  # Qwen3 has an explicit head_dim with num_heads * head_dim != hidden_size
         H, KV = cfg.num_attention_heads, cfg.num_key_value_heads
         hq = H // Lc
         kvp = KV // Lc
@@ -141,8 +144,9 @@ class DTPQwen3(nn.Module):
         k = torch.einsum("lbsd,lhed->lbshe", x, Wk)
         v = torch.einsum("lbsd,lhed->lbshe", x, Wv)
 
-        q = attn.q_norm(q)  # RMSNorm over head_dim, before RoPE
-        k = attn.k_norm(k)
+        if hasattr(attn, "q_norm"):  # Qwen3: RMSNorm over head_dim, before RoPE (Llama has none)
+            q = attn.q_norm(q)
+            k = attn.k_norm(k)
         q = q.permute(0, 1, 3, 2, 4)  # [L, B, h, S, e]
         k = k.permute(0, 1, 3, 2, 4)
         v = v.permute(0, 1, 3, 2, 4)
@@ -310,9 +314,9 @@ def load_dtp_qwen3(
     stage3_own_scale="sqrt_l",
     gradient_checkpointing=False,
 ):
-    from transformers import Qwen3ForCausalLM
+    from transformers import AutoModelForCausalLM
 
-    hf = Qwen3ForCausalLM.from_pretrained(model_id, dtype=dtype)
+    hf = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype)
     if state_dict_path:
         sd = torch.load(state_dict_path, map_location="cpu", weights_only=True)
         hf.load_state_dict(sd)

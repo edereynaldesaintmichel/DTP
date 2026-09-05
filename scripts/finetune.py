@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dtp.data import batched, packed_stream, perplexity, wikitext_blocks
+from dtp.data import batched, packed_stream, perplexity, token_file_stream, wikitext_blocks
 from dtp.model import DTPQwen3
 
 
@@ -128,6 +128,9 @@ def main():
                    help="freeze the (tied) 156M-param embedding/LM head")
     p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
     p.add_argument("--dataset-config", default="sample-10BT")
+    p.add_argument("--token-file", default=None,
+                   help="pre-tokenised .npy (scripts/pretokenize.py) instead of streaming --dataset")
+    p.add_argument("--token-skip", type=int, default=0, help="blocks of the token file to skip (e.g. calibration)")
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-blocks", type=int, default=32)
     p.add_argument("--save-every", type=int, default=500)
@@ -151,11 +154,11 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     (out / "args.json").write_text(json.dumps(vars(args), indent=2))
 
-    from transformers import AutoTokenizer, Qwen3ForCausalLM
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.model_id)
     # fp32 master weights + bf16 autocast
-    hf = Qwen3ForCausalLM.from_pretrained(args.model_id, dtype=torch.float32)
+    hf = AutoModelForCausalLM.from_pretrained(args.model_id, dtype=torch.float32)
     if args.init_state:
         hf.load_state_dict(torch.load(args.init_state, map_location="cpu", weights_only=True))
     if args.init_perm:
@@ -201,7 +204,7 @@ def main():
     if args.distill:
         # The DTP wrapper's weights are views into `hf`, which is being trained —
         # the teacher must be a separate frozen copy of the original weights.
-        teacher = Qwen3ForCausalLM.from_pretrained(args.model_id, dtype=torch.bfloat16).to(device)
+        teacher = AutoModelForCausalLM.from_pretrained(args.model_id, dtype=torch.bfloat16).to(device)
         teacher.eval().requires_grad_(False)
 
         def loss_fn(x):  # noqa: F811 — replaces the one-hot CE loss
@@ -232,11 +235,11 @@ def main():
                             weight_decay=args.weight_decay, fused=True)
 
     eval_blk = wikitext_blocks(tok, args.seq_len, args.eval_blocks)
-    stream = batched(
-        packed_stream(tok, args.seq_len, args.dataset, args.dataset_config,
-                      shuffle_seed=args.seed),
-        args.micro_batch,
-    )
+    if args.token_file:
+        stream = token_file_stream(args.token_file, args.seq_len, args.token_skip)
+    else:
+        stream = packed_stream(tok, args.seq_len, args.dataset, args.dataset_config, shuffle_seed=args.seed)
+    stream = batched(stream, args.micro_batch)
     log = open(out / "log.csv", "w")
     log.write("step,loss,lr,tok_per_s,eval_ppl,eval_kl,delta,gate_ppl\n")
 

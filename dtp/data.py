@@ -68,3 +68,14 @@ def perplexity(forward_fn, blocks, device, micro_batch=4):
         total_tok += blk[:, 1:].numel()
     mean = total_nll / total_tok
     return torch.tensor(mean).exp().item(), mean
+
+
+def token_file_stream(path, seq_len, skip_blocks=0):
+    """Blocks of seq_len + 1 tokens from a pre-tokenised file (scripts/pretokenize.py),
+    same shape as packed_stream but bounded memory and fixed order."""
+    import numpy as np
+
+    toks = np.load(path, mmap_mode="r")
+    step = seq_len + 1
+    for i in range(skip_blocks * step, len(toks) - step + 1, step):
+        yield torch.from_numpy(np.array(toks[i : i + step], dtype=np.int64))

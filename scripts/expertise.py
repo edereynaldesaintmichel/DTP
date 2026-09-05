@@ -240,14 +240,14 @@ def main():
     print("  per-layer co-located fraction of the up edge: " + " ".join(f"{v:.2f}" for v in per_layer))
 
     # ---- evaluate
-    from transformers import AutoTokenizer, Qwen3ForCausalLM
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     device = "cuda"
     dtype = getattr(torch, args.dtype)
     tok = AutoTokenizer.from_pretrained(args.model_id)
     blocks = wikitext_blocks(tok, args.seq_len, args.n_blocks)
-    base_sd = Qwen3ForCausalLM.from_pretrained(args.model_id, dtype=dtype).state_dict()
-    hf = Qwen3ForCausalLM.from_pretrained(args.model_id, dtype=dtype).to(device).eval()
+    base_sd = AutoModelForCausalLM.from_pretrained(args.model_id, dtype=dtype).state_dict()
+    hf = AutoModelForCausalLM.from_pretrained(args.model_id, dtype=dtype).to(device).eval()
     dtp = DTPQwen3(hf, n_devices=L, delta=0).to(device).eval()
 
     def eval_all(tag):

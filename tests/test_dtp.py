@@ -211,3 +211,21 @@ def test_generate_runs():
     dtp = DTPQwen3(hf, n_devices=4, delta=4)
     out = dtp.generate(ids(1, 5), max_new_tokens=4)
     assert out.shape == (1, 9)
+
+
+def test_llama_l1_delta0_matches_hf():
+    """The wrapper is not Qwen3-specific: a Llama block (no q/k norm, tied
+    head_dim = hidden / heads) must match too."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    cfg = LlamaConfig(
+        vocab_size=V, hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+        num_attention_heads=8, num_key_value_heads=4, max_position_embeddings=256,
+    )
+    torch.manual_seed(7)
+    hf = LlamaForCausalLM(cfg).eval()
+    x = ids()
+    ref = hf(x).logits
+    for L in (1, 4):
+        got = DTPQwen3(hf, n_devices=L, delta=0)(x).logits
+        assert torch.allclose(ref, got, atol=2e-4, rtol=1e-4), (L, (ref - got).abs().max())

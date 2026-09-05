@@ -159,6 +159,33 @@ i.e. 2.5x fewer steps. At 500 steps the dot-product score (`--score add`)
 gives 19.31 and the first-order score (`--score fo`) 18.33, vs 20.8 and 21.6
 for two random seeds.
 
+Other models: the wrapper works for any pre-norm GQA/SwiGLU model with the HF
+Llama module layout (q/k head norms are applied only if present). Every script
+takes `--model-id`. On a box with little host RAM, pre-tokenise once instead of
+streaming (the `datasets` streaming reader buffers whole 2 GB parquet shards):
+
+```bash
+M=h2oai/h2o-danube3-500m-base   # Llama block, 16 layers, 16 q / 8 KV heads, FFN 4096
+python scripts/pretokenize.py --model-id $M --tokens 34000000 --out runs/fineweb_tokens.npy
+python scripts/affinity_stats.py --model-id $M --token-file runs/fineweb_tokens.npy --out runs/affinity_stats.pt
+python scripts/expertise.py --model-id $M --score fo --save-dir runs/perms
+python scripts/finetune.py --model-id $M --token-file runs/fineweb_tokens.npy --token-skip 64 ...
+```
+
+Results on h2o-danube3-500m-base (L = 4, delta = 1, 2000 steps each, no shared
+neurons; `runs/expertise_logs/danube3_*`). Base model (delta 0) ppl 12.22:
+
+| step | first-order optimised: ppl / KL | contiguous (naive): ppl / KL |
+|---|---|---|
+| 0 (no training) | 4073 / 5.91 | 1673 / 5.02 |
+| 500 | 17.65 / 0.761 | 19.64 / 0.848 |
+| 1000 | 15.79 / 0.666 | 16.86 / 0.723 |
+| 2000 | 14.24 / 0.573 | 15.40 / 0.628 |
+
+Untrained, the optimised layout is worse than contiguous here (the opposite of
+Qwen3), but it overtakes by step 100 and reaches the contiguous run's final
+perplexity at step 1100.
+
 Code, in reading order:
 
 - `scripts/affinity_stats.py` — the three affinity scores (`add`, `abl`, `fo`)
@@ -166,6 +193,7 @@ Code, in reading order:
 - `scripts/expertise.py` — `Chain` (the alternating optimiser), `apply_permutation`,
   random baselines, untrained evaluation
 - `scripts/finetune.py` — `--init-perm` applies a saved layout before training
+- `scripts/pretokenize.py` — fixed token file for `--token-file` (bounded memory, identical tokens for every layout)
 - `dtp/shared_model.py`, `scripts/expertise_shared.py` — variant with a "shared
   expert": 10% of each layer's neurons replicated on every device, added locally
   and never broadcast (`--shared 308` in finetune.py). 16.26 / 0.260 at 2000

@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dtp.data import batched, packed_stream
+from dtp.data import batched, packed_stream, token_file_stream
 
 
 def main():
@@ -40,14 +40,15 @@ def main():
     p.add_argument("--blocks", type=int, default=64, help="calibration blocks of seq-len tokens")
     p.add_argument("--micro-batch", type=int, default=2)
     p.add_argument("--out", default="runs/affinity_stats.pt")
+    p.add_argument("--token-file", default=None, help="pre-tokenised .npy instead of streaming --dataset")
     p.add_argument("--no-abl", action="store_true")
     args = p.parse_args()
 
-    from transformers import AutoTokenizer, Qwen3ForCausalLM
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     device = "cuda"
     tok = AutoTokenizer.from_pretrained(args.model_id)
-    hf = Qwen3ForCausalLM.from_pretrained(args.model_id, dtype=torch.float32).to(device).eval()
+    hf = AutoModelForCausalLM.from_pretrained(args.model_id, dtype=torch.float32).to(device).eval()
     cfg = hf.config
     layers = hf.model.layers
     NL, D, H, KV, I = cfg.num_hidden_layers, cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.intermediate_size
@@ -98,7 +99,10 @@ def main():
         s = torch.sigmoid(g)
         return s * (1 + g * (1 - s))
 
-    stream = packed_stream(tok, args.seq_len, args.dataset, args.dataset_config)
+    if args.token_file:
+        stream = token_file_stream(args.token_file, args.seq_len)
+    else:
+        stream = packed_stream(tok, args.seq_len, args.dataset, args.dataset_config)
     with torch.no_grad():
         for bi, blk in enumerate(islice(batched(stream, args.micro_batch), args.blocks // args.micro_batch)):
             blk = blk.to(device)

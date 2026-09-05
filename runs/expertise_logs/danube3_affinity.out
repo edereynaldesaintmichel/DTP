@@ -1,0 +1,33 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/147 [00:00<?, ?it/s]Loading weights:  15%|█▍        | 22/147 [00:00<00:00, 191.81it/s]Loading weights:  52%|█████▏    | 76/147 [00:00<00:00, 375.18it/s]Loading weights:  88%|████████▊ | 130/147 [00:00<00:00, 437.42it/s]Loading weights: 100%|██████████| 147/147 [00:00<00:00, 433.57it/s]
+L=16 D=1536 H=16 KV=8 hd=96 I=4096
+batch 0: 2048 tokens
+batch 4: 10240 tokens
+batch 8: 18432 tokens
+batch 12: 26624 tokens
+batch 16: 34816 tokens
+batch 20: 43008 tokens
+batch 24: 51200 tokens
+batch 28: 59392 tokens
+saved runs/affinity_stats.pt (65536 tokens)
+
+rms shift when removing one head (mean |rms_wo/rms - 1|), per layer:
+0.041 0.007 0.008 0.007 0.008 0.009 0.009 0.008 0.008 0.011 0.009 0.010 0.009 0.009 0.009 0.017
+
+layer | spearman up add~abl | up add~fo | up abl~fo | down add~abl | top-KVgroup share (up, add) | top-KVgroup share (down, add)
+    0 |    0.993            |    0.671  |    0.683  |    0.977     | 0.289 (uniform 0.125)          | 0.182
+    1 |    0.992            |    0.643  |    0.653  |    0.976     | 0.340 (uniform 0.125)          | 0.204
+    2 |    0.997            |    0.848  |    0.854  |    0.999     | 0.315 (uniform 0.125)          | 0.208
+    3 |    0.997            |    0.865  |    0.872  |    0.999     | 0.275 (uniform 0.125)          | 0.198
+    4 |    0.997            |    0.896  |    0.899  |    0.999     | 0.329 (uniform 0.125)          | 0.214
+    5 |    0.999            |    0.906  |    0.906  |    0.999     | 0.286 (uniform 0.125)          | 0.194
+    6 |    0.996            |    0.900  |    0.899  |    1.000     | 0.352 (uniform 0.125)          | 0.223
+    7 |    0.996            |    0.882  |    0.883  |    1.000     | 0.282 (uniform 0.125)          | 0.205
+    8 |    0.998            |    0.870  |    0.869  |    1.000     | 0.273 (uniform 0.125)          | 0.208
+    9 |    0.993            |    0.821  |    0.823  |    0.999     | 0.271 (uniform 0.125)          | 0.206
+   10 |    0.997            |    0.842  |    0.840  |    1.000     | 0.305 (uniform 0.125)          | 0.211
+   11 |    0.997            |    0.906  |    0.903  |    0.999     | 0.402 (uniform 0.125)          | 0.198
+   12 |    0.996            |    0.815  |    0.808  |    1.000     | 0.310 (uniform 0.125)          | 0.197
+   13 |    0.992            |    0.820  |    0.810  |    1.000     | 0.307 (uniform 0.125)          | 0.172
+   14 |    0.980            |    0.718  |    0.712  |    0.998     | 0.287 (uniform 0.125)          | 0.191
+   15 |    0.826            |    0.816  |    0.753  |      nan     | 0.477 (uniform 0.125)          | nan
