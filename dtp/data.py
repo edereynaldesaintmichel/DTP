@@ -70,12 +70,19 @@ def perplexity(forward_fn, blocks, device, micro_batch=4):
     return torch.tensor(mean).exp().item(), mean
 
 
-def token_file_stream(path, seq_len, skip_blocks=0):
+def token_file_stream(path, seq_len, skip_blocks=0, shuffle_seed=None):
     """Blocks of seq_len + 1 tokens from a pre-tokenised file (scripts/pretokenize.py),
-    same shape as packed_stream but bounded memory and fixed order."""
+    same shape as packed_stream but bounded memory. The first skip_blocks blocks
+    are left out (calibration data); the rest are visited in file order, or in a
+    seeded random order when shuffle_seed is given (the training-seed knob)."""
     import numpy as np
 
     toks = np.load(path, mmap_mode="r")
     step = seq_len + 1
-    for i in range(skip_blocks * step, len(toks) - step + 1, step):
-        yield torch.from_numpy(np.array(toks[i : i + step], dtype=np.int64))
+    n = len(toks) // step
+    order = torch.arange(skip_blocks, n)
+    if shuffle_seed is not None:
+        gen = torch.Generator().manual_seed(shuffle_seed)
+        order = order[torch.randperm(len(order), generator=gen)]
+    for b in order.tolist():
+        yield torch.from_numpy(np.array(toks[b * step : (b + 1) * step], dtype=np.int64))

@@ -10,6 +10,10 @@ Objective (maximised): sum over layers of
 Each edge matrix is normalised to unit mass per layer (--no-normalize to use raw
 units), so the objective reads as "number of edges times co-located fraction".
 
+Variants for the ablations: --minimise (anti-expertised), --layers (only some
+layers move), --heads-only / --neurons-only, --score add|abl|fo. Each saved
+*.perm.pt records its objective so the score-vs-outcome plot needs no re-run.
+
 Optimisation: coordinate ascent on the chain. Neurons given both neighbouring
 head partitions: exact balanced assignment (linear_sum_assignment on expanded
 slots). Heads given both neighbouring neuron assignments: exhaustive over all
@@ -91,9 +95,10 @@ def onehot(dev, L):
 
 
 class Chain:
-    def __init__(self, S_up, S_dn, L):
+    def __init__(self, S_up, S_dn, L, sign=1):
         # S_up: list of [G, I] per layer; S_dn: list of [I, G_next] per layer (len NL-1)
-        self.S_up, self.S_dn, self.L = S_up, S_dn, L
+        # sign = -1 minimises the objective instead (anti-expertised layout)
+        self.S_up, self.S_dn, self.L, self.sign = S_up, S_dn, L, sign
         self.NL = len(S_up)
         self.G = S_up[0].shape[0]
         self.I = S_up[0].shape[1]
@@ -116,7 +121,7 @@ class Chain:
         s = self.S_up[i].T @ onehot(head_dev[i], self.L)  # [I, L]
         if i + 1 < self.NL:
             s = s + self.S_dn[i] @ onehot(head_dev[i + 1], self.L)
-        return s
+        return self.sign * s
 
     def best_heads(self, i, neur_dev):
         """Exhaustive best labelled partition of layer i's KV groups given the
@@ -124,26 +129,37 @@ class Chain:
         M = self.S_up[i] @ onehot(neur_dev[i], self.L)  # [G, L] gain of putting group g on device l
         if i > 0:
             M = M + self.S_dn[i - 1].T @ onehot(neur_dev[i - 1], self.L)
-        scores = (self.P1h * M[None]).sum((1, 2))  # [P]
+        scores = self.sign * (self.P1h * M[None]).sum((1, 2))  # [P]
         return self.P[scores.argmax()].clone()
 
-    def solve(self, head_init, verbose=True, max_sweeps=20):
+    def solve(self, head_init, neur_init=None, free_heads=None, free_neurons=None, verbose=True, max_sweeps=20):
+        """Coordinate ascent from head_init. Layers with free_heads[i] False keep
+        head_init[i]; layers with free_neurons[i] False keep neur_init[i]."""
+        NL = self.NL
+        free_heads = [True] * NL if free_heads is None else free_heads
+        free_neurons = [True] * NL if free_neurons is None else free_neurons
         head_dev = [h.clone() for h in head_init]
-        neur_dev = [assign_neurons(self.neuron_score(i, head_dev), self.L) for i in range(self.NL)]
-        best = self.objective(head_dev, neur_dev)
-        if verbose:
-            print(f"  init (given heads): {best:.4f}")
-        for sweep in range(max_sweeps):
-            for i in range(self.NL):
-                head_dev[i] = self.best_heads(i, neur_dev)
+        neur_dev = [n.clone() for n in neur_init] if neur_init is not None else [None] * NL
+        for i in range(NL):
+            if free_neurons[i]:
                 neur_dev[i] = assign_neurons(self.neuron_score(i, head_dev), self.L)
-            cur = self.objective(head_dev, neur_dev)
+        assert all(n is not None for n in neur_dev), "frozen neurons need neur_init"
+        best = self.sign * self.objective(head_dev, neur_dev)
+        if verbose:
+            print(f"  init (given heads): {self.sign * best:.4f}")
+        for sweep in range(max_sweeps):
+            for i in range(NL):
+                if free_heads[i]:
+                    head_dev[i] = self.best_heads(i, neur_dev)
+                if free_neurons[i]:
+                    neur_dev[i] = assign_neurons(self.neuron_score(i, head_dev), self.L)
+            cur = self.sign * self.objective(head_dev, neur_dev)
             if verbose:
-                print(f"  sweep {sweep}: {cur:.4f}")
+                print(f"  sweep {sweep}: {self.sign * cur:.4f}")
             if cur <= best + 1e-9:
                 break
             best = cur
-        return head_dev, neur_dev, best
+        return head_dev, neur_dev, self.sign * best
 
 
 # ------------------------------------------------------------- permutation
@@ -177,6 +193,18 @@ def random_partition(G, I, L, gen, device="cpu"):
     return head.to(device), neur.to(device)
 
 
+def parse_layers(spec, NL):
+    """'0,4,8-11' -> sorted list of layer ids; None -> all layers."""
+    if spec is None:
+        return list(range(NL))
+    out = set()
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        out.update(range(int(a), int(b or a) + 1))
+    assert all(0 <= i < NL for i in out), f"layer ids must be in [0, {NL})"
+    return sorted(out)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--stats", default="runs/affinity_stats.pt")
@@ -186,27 +214,30 @@ def main():
     p.add_argument("--dn-score", default="add", choices=["add", "abl"], help="down-edge score")
     p.add_argument("--no-normalize", action="store_true")
     p.add_argument("--up-only", action="store_true", help="ignore the FFN -> next attention edge")
+    p.add_argument("--minimise", action="store_true", help="minimise the objective instead (anti-expertised layout)")
+    p.add_argument("--layers", default=None, help="only these layers move, e.g. '0,4,8-11'; the rest stay contiguous")
+    p.add_argument("--heads-only", action="store_true", help="only move KV groups; neurons stay contiguous")
+    p.add_argument("--neurons-only", action="store_true", help="only move neurons; KV groups stay contiguous")
+    p.add_argument("--tag", default="optimised", help="file name of the optimised layout in --save-dir")
     p.add_argument("--deltas", type=float, nargs="*", default=[0, 1, 2, 4])
     p.add_argument("--random-seeds", type=int, default=5)
     p.add_argument("--n-blocks", type=int, default=64)
     p.add_argument("--seq-len", type=int, default=1024)
     p.add_argument("--dtype", default="float32", choices=["bfloat16", "float32"])
-    p.add_argument("--save-dir", default=None, help="save permuted HF state dicts (optimised + randoms) here")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="device for the optimiser")
+    p.add_argument("--save-dir", default=None, help="save layouts (*.perm.pt) and permuted HF state dicts here")
+    p.add_argument("--perm-only", action="store_true", help="with --save-dir: save layouts only, no state dicts")
+    p.add_argument("--no-eval", action="store_true", help="optimise and save, skip the untrained ppl evaluation")
     p.add_argument("--check-lsa", action="store_true", help="compare the GPU assignment with scipy on layer 5")
     args = p.parse_args()
+    assert not (args.heads_only and args.neurons_only)
 
     L = args.devices
-    o = torch.load(args.stats)
+    dev_ = args.device
+    chain, o = load_chain(args.stats, args.score, args.dn_score, L, args.up_only, not args.no_normalize,
+                          dev_, sign=-1 if args.minimise else 1)
+    S_up, S_dn = chain.S_up, chain.S_dn
     NL, KV, hpg = o["NL"], o["KV"], o["hpg"]
-    dev_ = "cuda"
-    S_up = [o[f"S_up_{args.score}"][i].view(KV, hpg, -1).sum(1).double().to(dev_) for i in range(NL)]
-    S_dn = [o[f"S_dn_{args.dn_score}"][i].double().to(dev_) for i in range(NL - 1)]
-    if args.up_only:
-        S_dn = [torch.zeros_like(s) for s in S_dn]
-    if not args.no_normalize:
-        S_up = [s / s.sum() for s in S_up]
-        S_dn = [s / s.sum().clamp_min(1e-30) for s in S_dn]
-    chain = Chain(S_up, S_dn, L)
     n_edges = NL + (0 if args.up_only else NL - 1)
 
     # ---- objective: identity, random, optimised
@@ -229,15 +260,37 @@ def main():
         rand_parts.append(([h for h, _ in parts], [n for _, n in parts]))
         obj_rand.append(chain.objective(*rand_parts[-1]))
     print(f"co-located affinity (sum over {n_edges} edges; random expectation {n_edges / L:.2f}):")
-    print(f"  identity {obj_id:.3f}  random {np.mean(obj_rand):.3f} +- {np.std(obj_rand):.3f}")
-    print("optimising...")
-    head_dev, neur_dev, obj_opt = chain.solve(ident_h)
-    print(f"  optimised {obj_opt:.3f}  ({obj_opt / n_edges:.3f} co-located fraction per edge, random {1 / L:.3f})")
+    rand_s = f"  random {np.mean(obj_rand):.3f} +- {np.std(obj_rand):.3f}" if obj_rand else ""
+    print(f"  identity {obj_id:.3f}{rand_s}")
+    free = [i in parse_layers(args.layers, NL) for i in range(NL)]
+    free_h = [f and not args.neurons_only for f in free]
+    free_n = [f and not args.heads_only for f in free]
+    print("optimising" + (" (minimising)" if args.minimise else "")
+          + (f" layers {args.layers}" if args.layers else "")
+          + (" heads only" if args.heads_only else " neurons only" if args.neurons_only else "") + "...")
+    head_dev, neur_dev, obj_opt = chain.solve(ident_h, ident_n, free_h, free_n)
+    print(f"  {args.tag} {obj_opt:.3f}  ({obj_opt / n_edges:.3f} co-located fraction per edge, random {1 / L:.3f})")
     per_layer = []
     for i in range(NL):
         up = (onehot(head_dev[i], L).T @ S_up[i] @ onehot(neur_dev[i], L)).diagonal().sum().item() / S_up[i].sum().item()
         per_layer.append(up)
     print("  per-layer co-located fraction of the up edge: " + " ".join(f"{v:.2f}" for v in per_layer))
+
+    sd_dir = Path(args.save_dir) if args.save_dir else None
+    if sd_dir:
+        sd_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_perm(name, h, n, obj):
+        if sd_dir:
+            torch.save(dict(head_dev=[t.cpu() for t in h], neur_dev=[t.cpu() for t in n],
+                            objective=obj, co_located_fraction=obj / n_edges, n_edges=n_edges,
+                            args=vars(args)), sd_dir / f"{name}.perm.pt")
+
+    for s, (h, n) in enumerate(rand_parts):
+        save_perm(f"random{s}", h, n, obj_rand[s])
+    save_perm(args.tag, head_dev, neur_dev, obj_opt)
+    if args.no_eval:
+        return
 
     # ---- evaluate
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -262,6 +315,10 @@ def main():
     def reset():
         hf.load_state_dict(base_sd)
 
+    def save_state(name):
+        if sd_dir and not args.perm_only:
+            torch.save(hf.state_dict(), sd_dir / f"{name}.pt")
+
     # sanity: permutation leaves the vanilla model unchanged
     x0 = blocks[:1, :-1].to(device)
     ref = hf(x0).logits.float()
@@ -273,27 +330,60 @@ def main():
     print("wikitext-2 ppl:")
     results = {}
     results["identity"] = eval_all("identity")
-    sd_dir = Path(args.save_dir) if args.save_dir else None
-    if sd_dir:
-        sd_dir.mkdir(parents=True, exist_ok=True)
     for s, (h, n) in enumerate(rand_parts):
         apply_permutation(hf, h, n, L)
         results[f"random{s}"] = eval_all(f"random{s}")
-        if sd_dir:
-            torch.save(hf.state_dict(), sd_dir / f"random{s}.pt")
-            torch.save(dict(head_dev=[t.cpu() for t in h], neur_dev=[t.cpu() for t in n]), sd_dir / f"random{s}.perm.pt")
+        save_state(f"random{s}")
         reset()
     apply_permutation(hf, head_dev, neur_dev, L)
-    results["optimised"] = eval_all("optimised")
-    if sd_dir:
-        torch.save(hf.state_dict(), sd_dir / "optimised.pt")
-        torch.save(dict(head_dev=[t.cpu() for t in head_dev], neur_dev=[t.cpu() for t in neur_dev]), sd_dir / "optimised.perm.pt")
+    results[args.tag] = eval_all(args.tag)
+    save_state(args.tag)
 
     print("\nsummary (nll):")
     for d in args.deltas:
         r = [results[f"random{s}"][d][1] for s in range(args.random_seeds)]
-        print(f"  delta={d:g}: identity {results['identity'][d][1]:.4f}  random {np.mean(r):.4f} +- {np.std(r):.4f}  optimised {results['optimised'][d][1]:.4f}")
+        rand_s = f"  random {np.mean(r):.4f} +- {np.std(r):.4f}" if r else ""
+        print(f"  delta={d:g}: identity {results['identity'][d][1]:.4f}{rand_s}  {args.tag} {results[args.tag][d][1]:.4f}")
+
+
+def load_chain(stats, score, dn_score, L, up_only=False, normalize=True, device="cpu", sign=1):
+    """Build the Chain (edge matrices) from an affinity_stats.pt file."""
+    o = torch.load(stats)
+    NL, KV, hpg = o["NL"], o["KV"], o["hpg"]
+    S_up = [o[f"S_up_{score}"][i].view(KV, hpg, -1).sum(1).double().to(device) for i in range(NL)]
+    S_dn = [o[f"S_dn_{dn_score}"][i].double().to(device) for i in range(NL - 1)]
+    if up_only:
+        S_dn = [torch.zeros_like(x) for x in S_dn]
+    if normalize:
+        S_up = [x / x.sum() for x in S_up]
+        S_dn = [x / x.sum().clamp_min(1e-30) for x in S_dn]
+    return Chain(S_up, S_dn, L, sign=sign), o
+
+
+def score_perms():
+    """python scripts/expertise.py score --stats S --score fo a.perm.pt b.perm.pt ...
+    Re-scores saved layouts with one common objective (e.g. a layout built with
+    --score add, measured in fo units) and prints name, objective, co-located fraction."""
+    p = argparse.ArgumentParser()
+    p.add_argument("perms", nargs="+")
+    p.add_argument("--stats", default="runs/affinity_stats.pt")
+    p.add_argument("--devices", type=int, default=4)
+    p.add_argument("--score", default="fo", choices=["add", "abl", "fo"])
+    p.add_argument("--dn-score", default="add", choices=["add", "abl"])
+    p.add_argument("--up-only", action="store_true")
+    p.add_argument("--no-normalize", action="store_true")
+    args = p.parse_args(sys.argv[2:])
+    chain, _ = load_chain(args.stats, args.score, args.dn_score, args.devices, args.up_only, not args.no_normalize)
+    n_edges = chain.NL + (0 if args.up_only else chain.NL - 1)
+    print(f"layout,objective_{args.score},co_located_fraction")
+    for f in args.perms:
+        perm = torch.load(f, weights_only=True)
+        obj = chain.objective(perm["head_dev"], perm["neur_dev"])
+        print(f"{Path(f).name.removesuffix('.perm.pt')},{obj:.4f},{obj / n_edges:.4f}")
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "score":
+        score_perms()
+    else:
+        main()

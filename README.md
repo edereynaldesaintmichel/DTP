@@ -194,6 +194,16 @@ Code, in reading order:
   random baselines, untrained evaluation
 - `scripts/finetune.py` — `--init-perm` applies a saved layout before training
 - `scripts/pretokenize.py` — fixed token file for `--token-file` (bounded memory, identical tokens for every layout)
+- `scripts/paper_chain.py` — writes the sequential run chain for the paper experiments
+  (seeds, score-vs-outcome layouts, ablations, optional 10k-step runs); resumable
+
+Layout variants for ablations (`scripts/expertise.py`, all saved as `<tag>.perm.pt`
+with their objective): `--minimise` (anti-expertised), `--layers 0,4,8-11` (only
+those layers move, the rest stay contiguous), `--heads-only`, `--neurons-only`,
+`--score add|abl|fo`. `python scripts/expertise.py score --score fo *.perm.pt`
+re-scores any saved layouts with one common objective. `finetune.py --seed`
+shuffles the token-file block order, so seeds give independent runs (the danube3
+runs above predate this and used file order).
 - `dtp/shared_model.py`, `scripts/expertise_shared.py` — variant with a "shared
   expert": 10% of each layer's neurons replicated on every device, added locally
   and never broadcast (`--shared 308` in finetune.py). 16.26 / 0.260 at 2000

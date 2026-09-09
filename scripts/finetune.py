@@ -135,7 +135,7 @@ def main():
     p.add_argument("--eval-blocks", type=int, default=32)
     p.add_argument("--save-every", type=int, default=500)
     p.add_argument("--out", default="runs/dtp")
-    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--seed", type=int, default=1234, help="torch seed and data order (block shuffle of --token-file)")
     p.add_argument("--init-state", default=None,
                    help="state dict to load into the student before training (e.g. a permuted model)")
     p.add_argument("--init-perm", default=None,
@@ -236,7 +236,7 @@ def main():
 
     eval_blk = wikitext_blocks(tok, args.seq_len, args.eval_blocks)
     if args.token_file:
-        stream = token_file_stream(args.token_file, args.seq_len, args.token_skip)
+        stream = token_file_stream(args.token_file, args.seq_len, args.token_skip, shuffle_seed=args.seed)
     else:
         stream = packed_stream(tok, args.seq_len, args.dataset, args.dataset_config, shuffle_seed=args.seed)
     stream = batched(stream, args.micro_batch)
