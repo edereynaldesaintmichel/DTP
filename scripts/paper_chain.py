@@ -5,6 +5,7 @@ the final step, so the chain can be relaunched after a crash.
 
   python scripts/paper_chain.py --model-id h2oai/h2o-danube3-500m-base --name danube3 --n-layers 16 > chain_danube3.sh
   (setsid nohup bash chain_danube3.sh > runs/paper/danube3/chain.out 2>&1 < /dev/null &)
+  --gpus 0 1 splits the training runs across two GPUs (setup stays sequential; each lane logs to lane<i>.out).
 
 Studies (memory: workshop-paper-experiment-plan):
   1 seeds       optimised x3 / contiguous x3 training seeds
@@ -39,6 +40,8 @@ def main():
     p.add_argument("--long-steps", type=int, default=10000)
     p.add_argument("--tokens", type=int, default=None, help="token file size; default sized for the longest run")
     p.add_argument("--venv", default="/venv/main/bin/activate")
+    p.add_argument("--gpus", type=int, nargs="*", default=None,
+                   help="GPU ids; with several, runs are dealt round-robin into one lane per GPU and the lanes run in parallel")
     a = p.parse_args()
 
     root = f"runs/paper/{a.name}"
@@ -83,7 +86,13 @@ def main():
     if a.long:  # study 3
         runs.append(f"run opt_long {a.long_steps} {a.seeds[0]} \"--init-perm {perms}/optimised.perm.pt\" 250")
         runs.append(f"run contig_long {a.long_steps} {a.seeds[0]} \"\" 250")
-    out += runs + ["", "log done"]
+    if a.gpus and len(a.gpus) > 1:
+        for i, g in enumerate(a.gpus):
+            out += [f"lane{i}() {{", f"  export CUDA_VISIBLE_DEVICES={g}"] + ["  " + r for r in runs[i::len(a.gpus)]] + ["}", ""]
+        out += [f"lane{i} > {root}/lane{i}.out 2>&1 &" for i in range(len(a.gpus))] + ["wait"]
+    else:
+        out += runs
+    out += ["", "log done"]
     print("\n".join(out))
 
 
